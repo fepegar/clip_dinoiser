@@ -4,6 +4,7 @@
 # ---------------------------------------------------------------------------------------------------
 
 import os
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,7 @@ from mmseg.ops import resize
 from omegaconf import OmegaConf
 
 from models.builder import MODELS, build_model
+from models.maskclip.maskclip import MaskClip
 
 NORMALIZE = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
@@ -37,11 +39,15 @@ class DinoCLIP(nn.Module):
 
         # ==== build MaskCLIP backbone =====
         maskclip_cfg = OmegaConf.load(f"configs/{clip_backbone}.yaml")
-        self.clip_backbone = build_model(maskclip_cfg["model"], class_names=class_names)
+        self.clip_backbone: MaskClip = build_model(maskclip_cfg["model"], class_names=class_names)
         for param in self.clip_backbone.parameters():
             param.requires_grad = False
 
+        self.teachers_loaded = False
+
     def load_teachers(self):
+        if self.teachers_loaded:
+            return
         from models.FOUND.model import FoundModel, get_vit_encoder
 
         self.found_model = FoundModel()
@@ -64,6 +70,8 @@ class DinoCLIP(nn.Module):
 
         # ==== build transform =====
         self.dino_T = NORMALIZE
+
+        self.teachers_loaded = True
 
     def make_input_divisible(self, x: torch.Tensor) -> torch.Tensor:
         """Pad some pixels to make the input size divisible by the patch size."""
@@ -148,7 +156,7 @@ class DinoCLIP(nn.Module):
 
         # Forward pass
         # Encoder forward pass and get hooked intermediate values
-        _ = self.vit_encoder(batch)
+        _ = self.vit_encoder.to(batch.device)(batch)
 
         # Get decoder features
         feats = self.extract_feats(type_feats=self.enc_type_feats)
@@ -171,7 +179,7 @@ class DinoCLIP(nn.Module):
         x = self.make_input_divisible(x)
         maskclip_map, feat = self.clip_backbone(x, return_feat=True)
 
-        return feat, maskclip_map
+        return feat, maskclip_map  # (b, c, h, w), (b, prompts, h, w)
 
     @torch.no_grad()
     def get_found_preds(self, x: torch.Tensor, resize=None):
@@ -229,14 +237,19 @@ class CLIP_DINOiser(DinoCLIP):
                  feats_idx=-3, gamma=0.2, delta=0.99, in_dim=256, conv_kernel=3):
         super(CLIP_DINOiser, self).__init__(clip_backbone, class_names, vit_arch, vit_patch_size, enc_type_feats, gamma)
 
-        in_size = 768 if feats_idx != 'final' else 512
+        in_size = 512 if feats_idx == 'final' else 768
         self.gamma = gamma
         self.feats_idx = feats_idx
         self.delta = delta
         self.in_dim = in_dim
         self.bkg_decoder = nn.Conv2d(in_size, 1, (1, 1))
-        self.obj_proj = nn.Conv2d(in_size, in_dim, (conv_kernel, conv_kernel), padding=conv_kernel // 2,
-                                  padding_mode='replicate')
+        self.obj_proj = nn.Conv2d(
+            in_size,
+            in_dim,
+            (conv_kernel, conv_kernel),
+            padding=conv_kernel // 2,
+            padding_mode='replicate',
+        )
 
         # setup clip features for training
         if feats_idx != 'final':
@@ -252,44 +265,71 @@ class CLIP_DINOiser(DinoCLIP):
                 get_activation('clip_inter'))
             self.train_feats = train_feats
 
-    def forward_pass(self, x: torch.Tensor):
+    def forward_pass(
+        self,
+        x: torch.Tensor,
+        *,
+        use_dino: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self.make_input_divisible(x)
-        clip_proj_feats = self.get_clip_features(x)[0]
+        clip_proj_feats, _ = self.get_clip_features(x)  # discard MaskCLIP segmentation logits
+        # clip_proj_feats are the "Dense CLIP features F" in Fig. 5
+
         B, c_dim, h, w = clip_proj_feats.shape
-        if self.feats_idx != 'final':
-            clip_feats = self.train_feats['clip_inter']
+        if self.feats_idx == 'final':
+            clip_feats = clip_proj_feats
+        else:
+            clip_feats = self.train_feats['clip_inter']  # (b, n, c)
             B, N, c_dim = clip_feats.shape
             clip_feats = clip_feats[:, 1:, ].permute(0, 2, 1).reshape(B, c_dim, h, w)
+
+        clip_feats_normalized = clip_feats / clip_feats.norm(dim=1, keepdim=True)
+        bkg_out = self.bkg_decoder(clip_feats_normalized)
+
+        if use_dino:
+            self.load_teachers()
+            correlations = self.get_dino_corrs(x)
         else:
-            clip_feats = clip_proj_feats
-        proj_feats = self.obj_proj(clip_feats).reshape(B, self.in_dim, -1)
-        proj_feats = proj_feats / proj_feats.norm(dim=1, keepdim=True)
-        corrs = torch.matmul(proj_feats.permute(0, 2, 1), proj_feats).reshape(B, h * w, h, w)
-        output = clip_feats / clip_feats.norm(dim=1, keepdim=True)
-        bkg_out = self.bkg_decoder(output)
+            feats_for_corrs = self.obj_proj(clip_feats).reshape(B, self.in_dim, -1)  # conv3x3 in Fig. 5
+            feats_for_corrs_normalized = feats_for_corrs / feats_for_corrs.norm(dim=1, keepdim=True)  # (b, c, n)
+            correlations = torch.matmul(
+                feats_for_corrs_normalized.permute(0, 2, 1),
+                feats_for_corrs_normalized,
+            ).reshape(B, h * w, h, w)
 
-        return bkg_out, corrs, clip_proj_feats
+        return bkg_out, correlations, clip_proj_feats
 
-    def forward(self, x: torch.Tensor):
-        preds, corrs, output = self.forward_pass(x)
-        B, C, hf, wf = output.shape
-        preds = F.interpolate(preds, (hf, wf), mode="bilinear", align_corners=False)
+    def forward(self, x: torch.Tensor, *, use_dino: bool = False) -> torch.Tensor:
+        background_out, correlations, clip_proj_feats = self.forward_pass(
+            x,
+            use_dino=use_dino,
+        )
+        # clip_proj_feats are the "Dense CLIP features F" in Fig. 5
+        B, C, hf, wf = clip_proj_feats.shape
+        background_out = F.interpolate(
+            background_out,
+            (hf, wf),
+            mode="bilinear",
+            align_corners=False,
+        )
 
         # Compute weighted pooling --------------------------------------------------
         if self.gamma:
-            corrs[corrs < self.gamma] = 0.0
-        out_feats = self.compute_weighted_pool(output, corrs)
+            correlations[correlations < self.gamma] = 0.0
+
+        # "DINOised features F+" in Fig. 5
+        weighted_feats = self.compute_weighted_pool(clip_proj_feats, correlations)  # (b, 512, h, w)
 
         # Get the predictions --------------------------------------------------
-        output = self.clip_backbone.decode_head.cls_seg(out_feats)
+        seg_logits = self.clip_backbone.decode_head.cls_seg(weighted_feats)  # (b, prompts, h, w)
 
         if self.apply_found:
             # Compute FOUND --------------------------------------------------
-            soft_found = torch.sigmoid(preds.detach())
+            soft_found = torch.sigmoid(background_out.detach())
             r_soft_found = soft_found.reshape(-1)
-            nb_cls = output.shape[1]
+            nb_cls = seg_logits.shape[1]
             r_hard_found = (r_soft_found > 0.5).float()
-            uncertain = (output.max(dim=1)[0] < self.delta).reshape(-1)
-            output.reshape(1, nb_cls, -1)[:, 0, uncertain & (~r_hard_found.bool())] = 1.0  # background class
+            uncertain = (seg_logits.max(dim=1)[0] < self.delta).reshape(-1)
+            seg_logits.reshape(1, nb_cls, -1)[:, 0, uncertain & (~r_hard_found.bool())] = 1.0  # background class
 
-        return output
+        return seg_logits

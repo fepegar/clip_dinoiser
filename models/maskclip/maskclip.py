@@ -10,9 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmseg.ops import resize
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from torch import Tensor
-from open_clip import get_tokenizer,  create_model_from_pretrained
+from open_clip import get_tokenizer, create_model_from_pretrained
+from open_clip.model import CLIP, VisionTransformer
 from models.builder import MODELS
 import torchvision.transforms as T
 from .utils.prompt_templates import imagenet_templates
@@ -35,6 +36,7 @@ class MaskClip(nn.Module):
         self.patch_size = backbone.get('patch_size')
         self.img_size = tuple([backbone.get('img_size', 224)]*2)
         pretrained = decode_head.get("pretrained")
+        model: CLIP
         model, _ = create_model_from_pretrained(clip_model, pretrained=pretrained)
         model.eval()
         self.clip_T = OPENAI_NORMALIZE
@@ -73,7 +75,7 @@ class MaskClip(nn.Module):
         v = v.reshape(B, hw_shape[0], hw_shape[1], -1).permute(0, 3, 1, 2).contiguous()
 
         self.backbone.visual.positional_embedding.data = self._positional_embd
-        return v
+        return v  # (b, c, h, w)
 
     def extract_v(self, x, block):
         y = block.ln_1(x)
@@ -117,20 +119,20 @@ class MaskClip(nn.Module):
         pos_embed = torch.cat((cls_token_weight, pos_embed_weight), dim=1)
         return pos_embed
 
-    def forward(self, inputs: Tensor, return_feat=False) -> Tensor:
+    def forward(self, inputs: Tensor, return_feat=False) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """Encode images with backbone and decode into a semantic segmentation
         map of the same size as input."""
         inputs = self.clip_T(inputs)
-        x = self.extract_feat(inputs)
+        x = self.extract_feat(inputs)  # (b, c, h, w)
         if return_feat:
             seg_logits, feats = self.decode_head(x, return_feat)
-            return seg_logits, feats
+            return seg_logits, feats  # (b, prompts, h, w), (b, c, h, w)
         else:
             seg_logits = self.decode_head(x)
         return seg_logits
 
 class MaskClipHead(nn.Module):
-    def __init__(self, clip_model, class_names, in_channels=3, text_channels=512, use_templates=False, pretrained=None,
+    def __init__(self, clip_model: str, class_names, in_channels=3, text_channels=512, use_templates=False, pretrained=None,
                  **kwargs):
         super(MaskClipHead, self).__init__()
 
@@ -141,11 +143,13 @@ class MaskClipHead(nn.Module):
         self.in_channels = in_channels
         self.use_templates = use_templates
         self.tokenizer = get_tokenizer(clip_model)
+        model: CLIP
         model, _ = create_model_from_pretrained(clip_model, pretrained=pretrained)
         model.eval()
         self.register_buffer("class_embeddings", self._get_class_embeddings(model, class_names))
         self.proj = nn.Conv2d(self.in_channels, text_channels, 1, bias=False)
-        self.proj.weight = nn.Parameter(model.visual.proj.t()[:, :, None, None])
+        vit: VisionTransformer = model.visual
+        self.proj.weight = nn.Parameter(vit.proj.t()[:, :, None, None])
 
     @torch.no_grad()
     def update_vocab(self, class_names):
@@ -177,9 +181,9 @@ class MaskClipHead(nn.Module):
         return aug_embeddings.squeeze(1)
 
     def forward(self, inputs, return_feat=False):
-        v = inputs
-        feat = self.proj(v)
-        output = self.cls_seg(feat)
+        v = inputs  # (b, 768, h, w)
+        feat = self.proj(v)  # (b, 512, h, w)
+        output = self.cls_seg(feat)  # (b, prompts, h, w)
         if return_feat:
             return output, feat
         return output
