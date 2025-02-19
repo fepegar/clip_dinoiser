@@ -2,3 +2,7 @@ ftfy
 omegaconf
 open_clip_torch==2.24
 hydra-core
+torch==1.12.1
+torchvision==0.13.1
+openmim
+numpy<2
